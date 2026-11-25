@@ -1,0 +1,658 @@
+-- lang: Lua, file: mm2_farm_standalone.lua, target: MM2 Roblox (Place 66654135), executor: synapse/fluxus/etc.
+
+repeat task.wait(0.1) until game:IsLoaded()
+
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local HttpService      = game:GetService("HttpService")
+local StarterGui       = game:GetService("StarterGui")
+local VirtualUser      = game:GetService("VirtualUser")
+local RS               = game:GetService("ReplicatedStorage")
+local LocalPlayer      = Players.LocalPlayer
+
+local NAME, VERSION = "MM2FarmStandalone", "1.0.0"
+local env = (type(getgenv) == "function" and getgenv()) or _G
+if type(env[NAME]) == "table" and type(env[NAME].Unload) == "function" then pcall(env[NAME].Unload) end
+
+local Session = {alive = true, conns = {}, started = os.clock(), stats = {candies = 0, rounds = 0, fullBags = 0, roundBag = 0}}
+local function bind(signal, fn)
+    local c = signal:Connect(fn)
+    Session.conns[#Session.conns + 1] = c
+    return c
+end
+local function now()   return os.clock() end
+local function try(fn) local ok, v = pcall(fn) if ok then return v end end
+local function clamp(v, lo, hi) return math.min(hi, math.max(lo, v)) end
+local function plural(n, one, many) return n .. " " .. (n == 1 and one or many) end
+
+local FOLDER = "MM2 Hub"
+local FILES = {settings = FOLDER .. "/settings.json", stats = FOLDER .. "/stats.json", log = FOLDER .. "/log.txt"}
+local hasFiles = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+local function ensureFolder()
+    if hasFiles and type(isfolder) == "function" and type(makefolder) == "function" and not isfolder(FOLDER) then pcall(makefolder, FOLDER) end
+end
+local function readFile(path)  if hasFiles then return try(function() return isfile(path) and readfile(path) or nil end) end end
+local function writeFile(path, text) if hasFiles then ensureFolder() return (pcall(writefile, path, text)) end return false end
+
+local Log = {}
+function Log.add(text)
+    local stamp = try(function() return os.date("%H:%M:%S") end) or ""
+    if hasFiles and type(appendfile) == "function" then pcall(appendfile, FILES.log, "[" .. stamp .. "] " .. tostring(text) .. "\n") end
+end
+function Log.warn(text) warn("[MM2 Farm] " .. tostring(text)) Log.add("warn: " .. tostring(text)) end
+
+local AFTER_FULL  = {"reset", "spawn", "xp"}
+local Defaults = {
+    farm = true, speed = 17, prone = true, underRoute = false, avoid = 20,
+    farFromPlayers = false, bagSize = 40, noclip = true, afterFull = "reset",
+    antiAfk = false, antiFling = false,
+    keyFarm = "F2",
+}
+local Settings = {}
+for k, v in pairs(Defaults) do Settings[k] = v end
+local dirty = false
+
+local function validate(k, v)
+    local d = Defaults[k]
+    if d == nil or type(v) ~= type(d) then return nil end
+    if type(v) == "number" and (v ~= v or v == math.huge or v == -math.huge) then return nil end
+    if k == "speed"   then return math.floor(clamp(v, 1, 25)) end
+    if k == "avoid"   then return math.floor(clamp(v, 0, 100)) end
+    if k == "bagSize" then return v >= 45 and 50 or 40 end
+    if k == "afterFull" then return table.find(AFTER_FULL, v) and v or nil end
+    if k == "keyFarm" then return pcall(function() return Enum.KeyCode[v] end) and v or nil end
+    return v
+end
+local function set(k, v)
+    local value = validate(k, v)
+    if value == nil then return false end
+    if Settings[k] ~= value then Settings[k], dirty = value, true end
+    return true
+end
+local function loadSettings()
+    local data = try(function() return HttpService:JSONDecode(readFile(FILES.settings) or "{}") end)
+    if type(data) == "table" then
+        for k, v in pairs(data) do local value = validate(k, v) if value ~= nil then Settings[k] = value end end
+    end
+    Settings.farm = true  -- always start with farm on
+end
+local function saveSettings()
+    local ok, text = pcall(function() return HttpService:JSONEncode(Settings) end)
+    if ok then writeFile(FILES.settings, text) dirty = false end
+end
+
+local function notify(title, text)
+    pcall(function() StarterGui:SetCore("SendNotification", {Title = title, Text = text, Duration = 4}) end)
+end
+
+local LOBBY_RADIUS, MAP_RADIUS, COIN_RADIUS = 300, 1500, 5000
+local Game = {cc = nil, map = nil, roundId = 0, roundAt = -100, inRound = false, note = "lobby",
+    bag = 0, full = false, bagFull = false, roundGain = 0, pickupsStopped = false, murderers = {}, others = {}, imMurderer = false, bottom = nil, bottomRound = nil}
+
+local function myChar()
+    local char = LocalPlayer.Character
+    return char, char and char:FindFirstChild("HumanoidRootPart"), char and char:FindFirstChildOfClass("Humanoid")
+end
+
+function Game.findContainer()
+    if Game.cc and Game.cc.Parent and Game.map and Game.map.Parent == workspace then return Game.cc, Game.map end
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj:IsA("Model") and obj.Name ~= "Lobby" then
+            local cc = obj:FindFirstChild("CoinContainer")
+            if cc then return cc, obj end
+        end
+    end
+end
+function Game.coins()
+    local out, cc = {}, Game.cc
+    if not (cc and cc.Parent) then return out end
+    for _, c in ipairs(cc:GetChildren()) do
+        if c:IsA("BasePart") then
+            if c:FindFirstChild("TouchInterest") then out[#out + 1] = c end
+        elseif c:IsA("Model") or c:IsA("Folder") then
+            for _, c2 in ipairs(c:GetChildren()) do
+                if c2:IsA("BasePart") and c2:FindFirstChild("TouchInterest") then out[#out + 1] = c2 end
+            end
+        end
+    end
+    return out
+end
+function Game.coinLive(c) return c.Parent ~= nil and c:FindFirstChild("TouchInterest") ~= nil end
+function Game.lobbyPos()
+    if Game.lobbyRef then return Game.lobbyRef end
+    local lobby = workspace:FindFirstChild("Lobby")
+    if not lobby then return nil end
+    local box = lobby:FindFirstChild("Box")
+    Game.lobbyRef = (box and box:IsA("BasePart") and box.Position) or try(function() return lobby:GetPivot().Position end)
+    return Game.lobbyRef
+end
+function Game.spawnParts()
+    local sp = Game.map and Game.map:FindFirstChild("Spawns", true)
+    local out = {}
+    for _, s in ipairs(sp and sp:GetChildren() or {}) do if s:IsA("BasePart") then out[#out + 1] = s end end
+    return out
+end
+function Game.spawnPos() local s = Game.spawnParts()[1] return s and s.Position end
+function Game.mapBottom()
+    if Game.bottomRound == Game.roundId then return Game.bottom end
+    local lo, n = math.huge, 0
+    for _, child in ipairs(Game.map and Game.map:GetChildren() or {}) do
+        if child.Name ~= "CoinContainer" then
+            local parts = child:GetDescendants()
+            parts[#parts + 1] = child
+            for _, d in ipairs(parts) do
+                if d:IsA("BasePart") then
+                    local y = try(function() return d.Position.Y - d.Size.Y / 2 end)
+                    if y then lo = math.min(lo, y) end
+                    n = n + 1
+                    if n % 1000 == 0 then task.wait() end
+                end
+            end
+        end
+    end
+    Game.bottom, Game.bottomRound = lo < math.huge and lo or nil, Game.roundId
+    return Game.bottom
+end
+function Game.roundEnd()
+    local st = Session.stats
+    if st.roundBag > 0 then st.candies, st.rounds = st.candies + st.roundBag, st.rounds + 1 end
+    st.roundBag = 0
+end
+function Game.bagCap() return Game.bagMax or (Game.elite and 50) or Settings.bagSize end
+
+local function readBagFrame(bag)
+    local known = try(function() return bag.CurrencyFrame.Icon.Coins end)
+    local labels = {known}
+    for _, d in ipairs(bag:GetDescendants()) do
+        if d ~= known and d:IsA("TextLabel") then labels[#labels + 1] = d end
+    end
+    local n, max
+    for _, l in ipairs(labels) do
+        local txt = (try(function() return l.Text end) or ""):gsub(",", "")
+        local a, b = txt:match("(%d+)%s*/%s*(%d+)")
+        if a then n, max = tonumber(a), tonumber(b) break end
+        if not n then n = tonumber(txt:match("^%D*(%d+)%D*$") or "") end
+    end
+    local f = bag:FindFirstChild("Full", true)
+    return n, max, (f and f:IsA("GuiObject") and f.Visible) or false
+end
+function Game.readBag()
+    local box = try(function() return LocalPlayer.PlayerGui.MainGUI.Game.CoinBags.Container end)
+    if not box then return end
+    local n, max, full
+    local candy = box:FindFirstChild("Candy")
+    if candy and candy:IsA("GuiObject") then n, max, full = readBagFrame(candy) end
+    if not n then
+        for _, bag in ipairs(box:GetChildren()) do
+            if bag:IsA("GuiObject") and bag.Visible then
+                local bn, bmax, bf = readBagFrame(bag)
+                if bn and bn > (n or -1) then n, max, full = bn, bmax, bf end
+            end
+        end
+    end
+    if n then Game.bag = n Session.stats.roundBag = math.max(Session.stats.roundBag, n) end
+    if max then Game.bagMax = max end
+    Game.bagFull = full or (n ~= nil and n >= Game.bagCap())
+end
+
+local BOX_PRICE = 600
+local function numberIn(txt) return type(txt) == "string" and tonumber((txt:gsub("[^%d]", ""))) or nil end
+local DATA_RETRY = 5
+local Data = {}
+function Data.profile()
+    if not Data._profile and now() - (Data._profileTry or -DATA_RETRY) >= DATA_RETRY then
+        Data._profileTry = now()
+        Data._profile = try(function() return require(RS.Modules.ProfileData) end)
+    end
+    return Data._profile
+end
+local function readBalanceNow()
+    local n = numberIn(try(function() return LocalPlayer.PlayerGui.CrossPlatform.Halloween2026.MainEvent.Title.Tokens.Container.Amount.Text end))
+    if n then return n, "event" end
+    return nil
+end
+local BAL_CACHE = 0.5
+local balCache = {at = -math.huge}
+local function readBalance()
+    if now() - balCache.at >= BAL_CACHE then
+        balCache.n, balCache.src = readBalanceNow()
+        balCache.at = now()
+    end
+    return balCache.n, balCache.src
+end
+
+local function hasKnife(p, char)
+    local bp = p:FindFirstChild("Backpack")
+    return (bp and bp:FindFirstChild("Knife") or char and char:FindFirstChild("Knife")) ~= nil
+end
+
+local ROUND_GONE_AFTER = 3
+function Game.update()
+    local cc, map = Game.findContainer()
+    if cc then
+        Game.goneAt = nil
+    elseif Game.cc then
+        Game.goneAt = Game.goneAt or now()
+        if now() - Game.goneAt < ROUND_GONE_AFTER then cc, map = Game.cc, Game.map end
+    end
+    if cc ~= Game.cc then
+        if Game.cc then Game.roundEnd() end
+        Game.cc, Game.map = cc, map
+        Game.bag, Game.full, Game.bagFull, Game.roundGain = 0, false, false, 0
+        Game.startBal, Game.startSrc, Game.pickupsStopped = nil, nil, false
+        if cc then
+            Game.roundId, Game.roundAt = Game.roundId + 1, now()
+            Session.stats.roundBag = 0
+            Log.add("round on " .. map.Name)
+        end
+    end
+    local _, hrp, hum = myChar()
+    local inRound = false
+    if cc and cc.Parent and hrp and hum and hum.Health > 0 then
+        local here = hrp.Position
+        local lobby = Game.lobbyPos()
+        if not (lobby and (here - lobby).Magnitude < LOBBY_RADIUS) then
+            local sp = Game.spawnPos()
+            if sp and (here - sp).Magnitude < MAP_RADIUS then
+                inRound = true
+            else
+                for _, c in ipairs(Game.coins()) do
+                    if (c.Position - here).Magnitude <= COIN_RADIUS then inRound = true break end
+                end
+            end
+        end
+    end
+    Game.inRound = inRound
+    local murderers, others = {}, {}
+    Game.imMurderer = false
+    for _, p in ipairs(Players:GetPlayers()) do
+        local char = p.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local knife = cc ~= nil and hasKnife(p, char)
+        if p == LocalPlayer then
+            Game.imMurderer = knife
+        elseif root then
+            if knife then murderers[#murderers + 1] = root.Position end
+            others[#others + 1] = root.Position
+        end
+    end
+    Game.murderers, Game.others = murderers, others
+    if cc and cc.Parent then
+        Game.readBag()
+        local bal, src = readBalance()
+        if bal then
+            if not Game.startBal or src ~= Game.startSrc or bal < Game.startBal then Game.startBal, Game.startSrc = bal - Game.roundGain, src end
+            Game.roundGain = math.max(Game.roundGain, bal - Game.startBal)
+            Session.stats.roundBag = math.max(Session.stats.roundBag, Game.roundGain)
+        end
+        Game.full = Game.bagFull or Game.roundGain >= Game.bagCap() or Game.pickupsStopped
+    end
+    Game.note = not cc and "lobby" or (inRound and ("round on " .. map.Name) or "in the lobby, round running")
+end
+
+-- ─── MOVER ───────────────────────────────────────────────────────────────────
+local Mover = {path = nil, i = 0, pos = nil, v = 0, arrived = false, yaw = 0, prone = false, collide = {}}
+local ACCEL = 65
+local TURN_RATE = 8
+local LAY_TILT = CFrame.Angles(math.rad(-90), 0, 0)
+
+function Mover.go(points, prone)
+    local _, hrp = myChar()
+    if not hrp then return false end
+    if not Mover.path then
+        local lv = hrp.CFrame.LookVector
+        if math.abs(lv.Y) < 0.9 then Mover.yaw = math.atan2(-lv.X, -lv.Z) end
+        Mover.pos, Mover.v = hrp.Position, 0
+    end
+    Mover.path, Mover.i, Mover.prone, Mover.arrived = points, 1, prone, false
+    return true
+end
+function Mover.restoreCollision()
+    for part, v in pairs(Mover.collide) do if part.Parent then pcall(function() part.CanCollide = v end) end end
+    Mover.collide = {}
+end
+function Mover.stop()
+    if not Mover.path then return end
+    Mover.path, Mover.v = nil, 0
+    local _, hrp, hum = myChar()
+    if hrp then
+        local bv = hrp:FindFirstChild("_hub_bv")
+        if bv then bv:Destroy() end
+        pcall(function()
+            hrp.CFrame = CFrame.new(hrp.Position) * CFrame.Angles(0, Mover.yaw, 0)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end)
+    end
+    if hum then pcall(function() hum.PlatformStand = false hum:ChangeState(Enum.HumanoidStateType.GettingUp) end) end
+    Mover.restoreCollision()
+end
+local function turnToward(from, to, alpha)
+    local diff = (to - from + math.pi) % (2 * math.pi) - math.pi
+    return from + diff * alpha
+end
+
+bind(RunService.Heartbeat, function(dt)
+    if not Mover.path then return end
+    local _, hrp, hum = myChar()
+    if not hrp then return end
+    if not hrp:FindFirstChild("_hub_bv") then
+        local bv = Instance.new("BodyVelocity")
+        bv.Name, bv.Velocity, bv.MaxForce = "_hub_bv", Vector3.zero, Vector3.new(9e8, 9e8, 9e8)
+        bv.Parent = hrp
+    end
+    Mover.pos = Mover.pos or hrp.Position
+    local goal = Mover.path[Mover.i]
+    if goal then
+        local delta = goal - Mover.pos
+        local dist  = delta.Magnitude
+        local top   = Settings.speed
+        Mover.v = Mover.v < top and math.min(top, Mover.v + ACCEL * dt) or top
+        local step = Mover.v * dt
+        if step >= dist then
+            Mover.pos = goal
+            Mover.i   = Mover.i + 1
+            if Mover.i > #Mover.path then Mover.arrived = true end
+        else
+            Mover.pos = Mover.pos + delta.Unit * step
+        end
+        local flat = Vector3.new(delta.X, 0, delta.Z)
+        if Mover.prone and flat.Magnitude > 0.5 then
+            Mover.yaw = turnToward(Mover.yaw, math.atan2(-flat.X, -flat.Z), math.min(1, dt * TURN_RATE))
+        end
+    end
+    local cf = CFrame.new(Mover.pos) * CFrame.Angles(0, Mover.yaw, 0)
+    if Mover.prone then cf = cf * LAY_TILT end
+    hrp.CFrame = cf
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    if hum and Mover.prone ~= hum.PlatformStand then hum.PlatformStand = Mover.prone end
+end)
+bind(RunService.Stepped, function()
+    if not (Mover.path and Settings.noclip) then return end
+    local char = LocalPlayer.Character
+    for _, part in ipairs(char and char:GetChildren() or {}) do
+        if part:IsA("BasePart") and part.CanCollide then
+            if Mover.collide[part] == nil then Mover.collide[part] = true end
+            part.CanCollide = false
+        end
+    end
+end)
+bind(LocalPlayer.CharacterAdded, function() Mover.path, Mover.pos, Mover.v, Mover.collide = nil, nil, 0, {} end)
+
+bind(RunService.Heartbeat, function()
+    if not Settings.antiFling then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if hrp and (hrp.AssemblyLinearVelocity.Magnitude > 150 or hrp.AssemblyAngularVelocity.Magnitude > 150) then
+        hrp.AssemblyLinearVelocity  = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end
+    for _, v in ipairs(char:GetChildren()) do
+        if v:IsA("BasePart") and (v.AssemblyLinearVelocity.Magnitude > 150 or v.AssemblyAngularVelocity.Magnitude > 150) then
+            v.AssemblyLinearVelocity  = Vector3.zero
+            v.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+end)
+
+-- ─── FARM ────────────────────────────────────────────────────────────────────
+local VOID_GAP, VOID_MIN = 40, -450
+local PICKUP_RETRY     = 2
+local FULL_AFTER_MISSES = 4
+local Farm = {phase = "off", note = "farm off", target = nil, targetAt = 0, arrivedAt = nil, skip = {}, pending = {}, collected = 0, roundCollected = 0, misses = 0,
+    under = false, fullRound = nil, fullStarted = false, killAt = -100, kills = 0}
+
+function Farm.setNote(phase, note) Farm.phase, Farm.note = phase, note end
+function Farm.dangerAt(p)
+    if Game.imMurderer or Settings.avoid <= 0 then return false end
+    for _, m in ipairs(Game.murderers) do if (m - p).Magnitude < Settings.avoid then return true end end
+    return false
+end
+function Farm.nearestOther(p)
+    local best = math.huge
+    for _, o in ipairs(Game.others) do local d = (o - p).Magnitude if d < best then best = d end end
+    return best
+end
+function Farm.pick(here)
+    local best, bestScore, t = nil, nil, now()
+    for _, c in ipairs(Game.coins()) do
+        if not (Farm.skip[c] and Farm.skip[c] > t) and not Farm.dangerAt(c.Position) then
+            local d = (c.Position - here).Magnitude
+            local score = d
+            if Settings.farFromPlayers then
+                local od = Farm.nearestOther(c.Position)
+                if od <= d then score = 10000 + (d - od) end
+            end
+            if not bestScore or score < bestScore then best, bestScore = c, score end
+        end
+    end
+    return best
+end
+function Farm.routeTo(coin)
+    local _, hrp = myChar()
+    local here, p = hrp.Position, coin.Position
+    if Settings.underRoute then
+        local goal  = p - Vector3.new(0, Settings.prone and 1.2 or 2.5, 0)
+        local travelY = p.Y - 7.8
+        Mover.go({Vector3.new(here.X, math.min(here.Y, travelY), here.Z), Vector3.new(goal.X, travelY, goal.Z), goal}, Settings.prone)
+    else
+        Mover.go({p + Vector3.new(0, 0.5, 0)}, Settings.prone)
+    end
+end
+function Farm.touch(coin)
+    local _, hrp = myChar()
+    if type(firetouchinterest) ~= "function" or not hrp then return end
+    pcall(firetouchinterest, hrp, coin, 0)
+    pcall(firetouchinterest, hrp, coin, 1)
+end
+function Farm.underY(here)
+    local y = here.Y - VOID_GAP
+    local bottom = Game.mapBottom()
+    if bottom then y = math.min(y, bottom - VOID_GAP) end
+    for _, s in ipairs(Game.spawnParts()) do y = math.min(y, s.Position.Y - VOID_GAP) end
+    local killY = try(function() return workspace.FallenPartsDestroyHeight end) or -500
+    return math.max(y, VOID_MIN, killY + 30)
+end
+function Farm.goUnder()
+    local _, hrp = myChar()
+    if not hrp then return end
+    local here = hrp.Position
+    local y = Farm.underY(here)
+    Log.add(string.format("going under the map to y %.1f", y))
+    Mover.go({Vector3.new(here.X, math.min(y, here.Y), here.Z)}, false)
+    Farm.under, Farm.underAtY = true, math.floor(math.min(y, here.Y))
+end
+function Farm.surface()
+    local _, hrp = myChar()
+    local sp = Game.spawnPos()
+    Mover.stop()
+    if hrp and sp then pcall(function() hrp.CFrame = CFrame.new(sp + Vector3.new(0, 3, 0)) end) end
+    Farm.under = false
+end
+
+local VIM = game:GetService("VirtualInputManager")
+local function tapKey(key)
+    pcall(function() VIM:SendKeyEvent(true,  key, false, game) end)
+    task.wait(0.1)
+    pcall(function() VIM:SendKeyEvent(false, key, false, game) end)
+end
+function Farm.kill(char, hum, attempt)
+    pcall(function() hum.Health = 0 end)
+    pcall(function() hum:TakeDamage(math.huge) end)
+    pcall(function() hum:ChangeState(Enum.HumanoidStateType.Dead) end)
+    if attempt >= 2 then
+        local killY = try(function() return workspace.FallenPartsDestroyHeight end) or -500
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then pcall(function() hrp.CFrame = CFrame.new(hrp.Position.X, killY - 50, hrp.Position.Z) end) end
+        pcall(function() char:BreakJoints() end)
+        local head = char:FindFirstChild("Head")
+        if head then pcall(function() head:Destroy() end) end
+    end
+    if attempt >= 3 then
+        tapKey(Enum.KeyCode.Escape) task.wait(0.6)
+        tapKey(Enum.KeyCode.R)      task.wait(0.4)
+        tapKey(Enum.KeyCode.Return)
+    end
+end
+function Farm.afterFull(hrp, hum)
+    if Farm.fullRound ~= Game.roundId then
+        Farm.fullRound, Farm.fullStarted, Farm.killAt, Farm.kills = Game.roundId, false, -100, 0
+        Farm.target = nil
+        Session.stats.fullBags = Session.stats.fullBags + 1
+        Log.add("bag full (" .. Game.bag .. ")")
+    end
+    local mode = Settings.afterFull
+    if mode == "reset" then
+        Mover.stop()
+        if now() - Farm.killAt >= 3 then
+            Farm.killAt, Farm.kills = now(), Farm.kills + 1
+            Farm.kill(hrp.Parent, hum, Farm.kills)
+        end
+        Farm.setNote("full", "bag full, resetting")
+    elseif mode == "spawn" then
+        if not Farm.fullStarted then
+            Farm.fullStarted = true
+            local sp = Game.spawnPos()
+            if sp then Mover.go({sp + Vector3.new(0, 3, 0)}, false) else Mover.stop() end
+        end
+        if Mover.path and Mover.arrived then Mover.stop() end
+        Farm.setNote("full", Mover.path and "bag full, flying to spawn" or "bag full, at spawn")
+    elseif mode == "xp" then
+        if not Farm.fullStarted then Farm.fullStarted = true Farm.goUnder() end
+        Farm.setNote("holding", "bag full, holding under the map at y " .. tostring(Farm.underAtY or "?"))
+    else
+        Mover.stop()
+        Farm.setNote("full", "bag full")
+    end
+    return 0
+end
+function Farm.step()
+    if not Settings.farm then
+        if Farm.phase ~= "off" then
+            if Farm.under and Game.inRound then Farm.surface() else Mover.stop() end
+            Farm.target, Farm.under = nil, false
+            Farm.setNote("off", "farm off")
+        end
+        return 0.25
+    end
+    local _, hrp, hum = myChar()
+    if not (hrp and hum and hum.Health > 0) then
+        Mover.path, Farm.target, Farm.under = nil, nil, false
+        Farm.setNote("waiting", "waiting to respawn")
+        return 0
+    end
+    if not Game.inRound then
+        if Mover.path then Mover.stop() end
+        Farm.target, Farm.under, Farm.skip, Farm.pending = nil, false, {}, {}
+        Farm.roundCollected, Farm.misses = 0, 0
+        Farm.setNote("waiting", Game.cc and "waiting (you're in the lobby)" or "waiting for a round")
+        return 0
+    end
+    if Game.full then return Farm.afterFull(hrp, hum) end
+    local t = now()
+    for c, at in pairs(Farm.pending) do
+        if not Game.coinLive(c) then
+            Farm.pending[c], Farm.collected, Farm.misses = nil, Farm.collected + 1, 0
+            Farm.roundCollected = Farm.roundCollected + 1
+        elseif t - at > PICKUP_RETRY then
+            Farm.pending[c], Farm.misses = nil, Farm.misses + 1
+            if Farm.misses >= FULL_AFTER_MISSES and (Game.bag > 0 or Game.roundGain > 0 or Farm.roundCollected > 0) and not Game.pickupsStopped then
+                Game.pickupsStopped = true
+                Log.add("bag full: " .. Farm.misses .. " candies in a row didn't count")
+            end
+        end
+    end
+    local tgt = Farm.target
+    if tgt then
+        local skipFor
+        if not Game.coinLive(tgt)                      then skipFor = 30
+        elseif Farm.dangerAt(tgt.Position)             then skipFor = 3
+        elseif Settings.farFromPlayers and Farm.nearestOther(tgt.Position) + 2 < (tgt.Position - hrp.Position).Magnitude then skipFor = 5
+        elseif t - Farm.targetAt > 30                  then skipFor = 20
+        elseif Mover.arrived then
+            Farm.touch(tgt)
+            Farm.pending[tgt] = t
+            skipFor = PICKUP_RETRY
+        end
+        if skipFor then
+            Farm.skip[tgt], Farm.target = t + skipFor, nil
+        else
+            Farm.setNote("farming", plural(Farm.collected, "candy", "candies") .. " collected")
+            return 0
+        end
+    end
+    local coin = Farm.pick(hrp.Position)
+    if not coin then
+        Farm.setNote("searching", "no safe candy yet")
+        return 0
+    end
+    Farm.target, Farm.targetAt, Farm.arrivedAt, Farm.under = coin, t, nil, false
+    Farm.routeTo(coin)
+    Farm.setNote("farming", plural(Farm.collected, "candy", "candies") .. " collected")
+    return 0
+end
+
+-- ─── ANTI-AFK ────────────────────────────────────────────────────────────────
+bind(LocalPlayer.Idled, function()
+    if not Settings.antiAfk then return end
+    pcall(function() VirtualUser:CaptureController() VirtualUser:ClickButton2(Vector2.new()) end)
+end)
+
+-- ─── KEYBIND ─────────────────────────────────────────────────────────────────
+bind(UserInputService.InputBegan, function(input, processed)
+    if processed or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if input.KeyCode.Name == Settings.keyFarm then
+        set("farm", not Settings.farm)
+        notify("MM2 Farm", "Farm " .. (Settings.farm and "ON" or "OFF"))
+    end
+end)
+
+-- ─── LOOPS ───────────────────────────────────────────────────────────────────
+local function loop(name, body)
+    task.spawn(function()
+        local lastErr = -10
+        while Session.alive do
+            local ok, delay = pcall(body)
+            if not ok then
+                if now() - lastErr > 5 then lastErr = now() Log.warn(name .. ": " .. tostring(delay)) end
+                if name == "farm" then Farm.note = "error: " .. tostring(delay):sub(1, 90) end
+                delay = 0.5
+            end
+            if not Session.alive then break end
+            task.wait(type(delay) == "number" and delay or 0.1)
+        end
+    end)
+end
+
+local API = {}
+function API.Unload()
+    if not Session.alive then return end
+    Session.alive = false
+    Mover.stop()
+    for _, c in ipairs(Session.conns) do pcall(function() c:Disconnect() end) end
+    Session.conns = {}
+    saveSettings()
+    if env[NAME] == API then env[NAME] = nil end
+end
+env[NAME] = API
+
+loadSettings()
+writeFile(FILES.log, "MM2 Farm Standalone log\n")
+
+task.spawn(function()
+    local ok, elite = pcall(function() return RS.Remotes.Extras.AmElite:InvokeServer() end)
+    if ok and elite == true then Game.elite = true Log.add("elite detected: bag size 50") end
+end)
+
+loop("game", function() Game.update() return 0 end)
+loop("farm", Farm.step)
+loop("save", function()
+    if dirty then saveSettings() end
+    return 1
+end)
+
+notify("MM2 Farm", "Running. F2 toggles the farm. Call MM2FarmStandalone.Unload() to stop.")
+print("[MM2 Farm] loaded. Unload: MM2FarmStandalone.Unload()")
