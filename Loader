@@ -1,7 +1,7 @@
 repeat task.wait(0.1) until game:IsLoaded()
 getgenv().AbortExecution = false
 
-local NAME, VERSION = "MM2Hub", "3.5.3"
+local NAME, VERSION = "MM2Hub", "3.5.5"
 local env = (type(getgenv) == "function" and getgenv()) or _G
 if type(env[NAME]) == "table" and type(env[NAME].Unload) == "function" then pcall(env[NAME].Unload) end
 
@@ -294,13 +294,12 @@ function Data.owned(currency)
     return type(n) == "number" and n or nil
 end
 local function readBalanceNow()
-    local _, currency = Data.box()
-    local fromData = Data.owned(currency)
-    if fromData then return fromData, "data" end
-    local _, owned = candyBox()
-    if owned then return owned, "box" end
-    local n = numberIn(try(function() return LocalPlayer.PlayerGui.CrossPlatform.Halloween2026.MainEvent.Title.Tokens.Container.Amount.Text end))
-    if n then return n, "event" end
+    -- Read only the regular coin currency, never Halloween tokens or a box price.
+    local p = Data.profile()
+    if type(p) ~= "table" then return nil end
+    local n = try(function() return p.Materials.Owned.Coins end)
+    if type(n) ~= "number" then n = try(function() return p.Coins end) end
+    if type(n) == "number" and n >= 0 then return n, "coins" end
     return nil
 end
 local BAL_CACHE = 0.5
@@ -655,7 +654,7 @@ function Farm.step()
             Farm.pending[c], Farm.misses = nil, Farm.misses + 1
             if Farm.misses >= FULL_AFTER_MISSES and (Game.bag > 0 or Game.roundGain > 0 or Farm.roundCollected > 0) and not Game.pickupsStopped then
                 Game.pickupsStopped = true
-                Log.add("bag full: " .. Farm.misses .. " candies in a row didn't count")
+                Log.add("bag full: " .. Farm.misses .. " coins in a row didn't count")
             end
         end
     end
@@ -674,18 +673,18 @@ function Farm.step()
         if skipFor then
             Farm.skip[tgt], Farm.target = t + skipFor, nil
         else
-            Farm.setNote("farming", plural(Farm.collected, "candy", "candies") .. " collected")
+            Farm.setNote("farming", plural(Farm.collected, "coin", "coins") .. " collected")
             return 0
         end
     end
     local coin = Farm.pick(hrp.Position)
     if not coin then
-        Farm.setNote("searching", "no safe candy yet")
+        Farm.setNote("searching", "no safe coin yet")
         return 0
     end
     Farm.target, Farm.targetAt, Farm.arrivedAt, Farm.under = coin, t, nil, false
     Farm.routeTo(coin)
-    Farm.setNote("farming", plural(Farm.collected, "candy", "candies") .. " collected")
+    Farm.setNote("farming", plural(Farm.collected, "coin", "coins") .. " collected")
     return 0
 end
 
@@ -793,10 +792,10 @@ function Stats.rows()
     local total, st = Stats.total(), Session.stats
     local owned = readBalance()
     local rows = {
-        {"Candy owned", owned and Stats.commas(owned) or "open the box once"},
+        {"Coins owned", owned and Stats.commas(owned) or "unavailable"},
         {"Running", Stats.clock(up)},
-        {"Candies / hour", Stats.perHour(total, up)},
-        {"Candies Total", total},
+        {"Coins / hour", Stats.perHour(total, up)},
+        {"Coins Total", total},
         {"Rounds", st.rounds},
         {"Full bags", st.fullBags},
         {"Bag", math.max(Game.bag, Game.roundGain or 0) .. " / " .. Game.bagCap() .. (Game.full and " (full)" or "")},
@@ -829,8 +828,8 @@ function Hook.payload(title, s, description)
     return {username = Hook.name(), allowed_mentions = {parse = {}}, embeds = {{
         title = title, description = description, color = 0x9655FF,
         fields = {
-            {name = "Candies Total", value = s.balance and commas(s.balance) or "unknown", inline = true},
-            {name = "Candies / Hour", value = commas(s.perHour), inline = true},
+            {name = "Coins Total", value = s.balance and commas(s.balance) or "unknown", inline = true},
+            {name = "Coins / Hour", value = commas(s.perHour), inline = true},
             {name = "Running Time", value = Stats.clock(s.up), inline = true},
             {name = "Full Bags", value = tostring(s.fullBags), inline = true},
             {name = "Rounds", value = tostring(s.rounds), inline = true},
@@ -937,16 +936,16 @@ local function pages()
     for i, m in ipairs(HOOK_TIMES) do every[i] = {HOOK_LABELS[i], m} end
     return {
         {name = "Farm", items = {
-            {"section", "Candy Farm"},
-            {"toggle", "Candy farm", "farm"},
+            {"section", "Coin Farm"},
+            {"toggle", "Coin farm", "farm"},
             {"keybind", "Toggle key", "keyFarm"},
             {"slider", "Fly speed", "speed", 1, 25, " studs/s", 20},
             {"choice", "Position", "prone", {{"Lying down", true}, {"Standing", false}}},
             {"choice", "Route", "underRoute", {{"Straight", false}, {"Under the floor", true}}},
             {"toggle", "Noclip while flying", "noclip"},
-            {"section", "Candy Target"},
+            {"section", "Coin Target"},
             {"choice", "Go for", "farFromPlayers", {{"Nearest", false}, {"Far from players", true}}},
-            {"help", "Far from players skips candies that other players will reach first."},
+            {"help", "Far from players skips coins that other players will reach first."},
             {"slider", "Avoid the murderer", "avoid", 0, 100, " studs"},
         }},
         {name = "Bag Full", items = {
@@ -960,7 +959,7 @@ local function pages()
         {name = "Misc", items = {
             {"section", "Auto Vote"},
             {"toggle", "Spam vote the best map", "autoVote"},
-            {"help", "Stands on the pad of the map with the most candies, and resets to vote again while voting is open."},
+            {"help", "Stands on the pad of the map with the most coins, and resets to vote again while voting is open."},
             {"section", "Anti-AFK"},
             {"toggle", "Anti-AFK", "antiAfk"},
             {"toggle", "Anti-Fling", "antiFling"},
@@ -1324,7 +1323,7 @@ function UI.build()
         if name == Settings.keyFarm then
             set("farm", not Settings.farm)
             refresh("farm")
-            notify("MM2 Hub", "Candy farm " .. (Settings.farm and "on" or "off"))
+            notify("MM2 Hub", "Coin farm " .. (Settings.farm and "on" or "off"))
         elseif name == Settings.keyMenu then
             UI.toggle()
         end
