@@ -1439,6 +1439,20 @@ bind(RunService.Heartbeat, function(dt)
     Mover.pos = Mover.pos or hrp.Position
     local goal = Mover.path[Mover.i]
     if goal then
+        -- Keep the prone body horizontal and point its head along the route.
+        -- On vertical legs, look ahead to the next horizontal segment.
+        if Mover.prone then
+            local from = Mover.pos
+            for i = Mover.i, #Mover.path do
+                local point = Mover.path[i]
+                local delta = point - from
+                if delta.X * delta.X + delta.Z * delta.Z > 0.000001 then
+                    Mover.yaw = math.atan2(-delta.X, -delta.Z)
+                    break
+                end
+                from = point
+            end
+        end
         local top = Settings.speed
         local arrived = false
         if Settings.flightMode == "teleport" then
@@ -1486,7 +1500,6 @@ bind(RunService.Heartbeat, function(dt)
             Mover.i = Mover.i + 1
             if Mover.i > #Mover.path then Mover.arrived = true end
         end
-        -- Keep the starting yaw fixed; movement never turns toward a coin.
     end
     if Settings.flightMode == "teleport" then Mover.prone = false end
     local cf = CFrame.new(Mover.pos) * CFrame.Angles(0, Mover.yaw, 0)
@@ -1961,10 +1974,10 @@ function Farm.step()
     return 0
 end
 
-local PathESP = {folder = nil, lines = {}, highlight = nil, elapsed = 0}
+local PathESP = {folder = nil, lines = {}, elapsed = 0}
 function PathESP.clear()
     if PathESP.folder then PathESP.folder:Destroy() end
-    PathESP.folder, PathESP.anchor, PathESP.highlight, PathESP.lines = nil, nil, nil, {}
+    PathESP.folder, PathESP.anchor, PathESP.lines = nil, nil, {}
 end
 function PathESP.ensure()
     if PathESP.folder and PathESP.folder.Parent then return end
@@ -1981,14 +1994,6 @@ function PathESP.ensure()
     anchor.Transparency, anchor.CastShadow = 1, false
     anchor.Parent = folder
     PathESP.anchor = anchor
-    local highlight = Instance.new("Highlight")
-    highlight.Name = "SelectedCoin"
-    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-    highlight.FillColor = Color3.fromRGB(255, 209, 78)
-    highlight.OutlineColor = Color3.fromRGB(255, 242, 173)
-    highlight.FillTransparency, highlight.OutlineTransparency = 0.78, 0
-    highlight.Parent = folder
-    PathESP.highlight = highlight
 end
 function PathESP.line(index, from, to)
     local delta = to - from
@@ -1999,15 +2004,41 @@ function PathESP.line(index, from, to)
         line.Name = "RouteSegment"
         line.Adornee = PathESP.anchor
         line.AlwaysOnTop, line.ZIndex = true, 2
-        line.Thickness = 3
-        line.Color3 = Color3.fromRGB(179, 151, 255)
-        line.Transparency = 0.1
+        line.Thickness = 6
+        line.Color3 = Color3.fromRGB(255, 255, 48)
+        line.Transparency = 0
         line.Parent = PathESP.folder
         PathESP.lines[index] = line
     end
     line.CFrame = PathESP.anchor.CFrame:ToObjectSpace(CFrame.lookAt(from, to))
     line.Length, line.Visible = delta.Magnitude, true
     return true
+end
+-- Draw a transparent, twelve-edge box around the coin using the same
+-- always-on-top line adornments as the route.
+function PathESP.box(target, count)
+    local half = target.Size / 2 + Vector3.new(0.15, 0.15, 0.15)
+    local cf = target.CFrame
+    local corners = {}
+    for x = 0, 1 do
+        for y = 0, 1 do
+            for z = 0, 1 do
+                local index = 1 + x * 4 + y * 2 + z
+                corners[index] = cf:PointToWorldSpace(Vector3.new(
+                    (2 * x - 1) * half.X, (2 * y - 1) * half.Y, (2 * z - 1) * half.Z))
+            end
+        end
+    end
+    for i = 0, 7 do
+        for _, stride in ipairs({1, 2, 4}) do
+            if math.floor(i / stride) % 2 == 0 then
+                if PathESP.line(count + 1, corners[i + 1], corners[i + stride + 1]) then
+                    count = count + 1
+                end
+            end
+        end
+    end
+    return count
 end
 function PathESP.step(dt)
     local target = Farm.target
@@ -2022,7 +2053,6 @@ function PathESP.step(dt)
     if PathESP.folder and PathESP.folder.Parent and PathESP.elapsed < 1 / 20 then return end
     PathESP.elapsed = 0
     PathESP.ensure()
-    PathESP.highlight.Adornee = target
     local from, count = root.Position, 0
     for i = Mover.i, #Mover.path do
         local point = Mover.path[i]
@@ -2031,6 +2061,7 @@ function PathESP.step(dt)
     end
     -- Include the selected coin itself when the configured movement ends just above or below it.
     if PathESP.line(count + 1, from, target.Position) then count = count + 1 end
+    count = PathESP.box(target, count)
     for i = count + 1, #PathESP.lines do PathESP.lines[i].Visible = false end
 end
 bind(RunService.Heartbeat, function(dt)
@@ -2051,7 +2082,7 @@ bind(LocalPlayer.Idled, function()
     AntiAfk.runs = AntiAfk.runs + 1
 end)
 
-local Stats = {earned = 0, last = {}, showTrue = false, rateClicks = {}}
+local Stats = {earned = 0, last = {}, showTrue = false, rateClicks = {}, trueRateAt = -math.huge}
 function Stats.commas(n)
     local s = tostring(math.floor(n))
     while true do local k s, k = s:gsub("^(%d+)(%d%d%d)", "%1,%2") if k == 0 then return s end end
@@ -2081,17 +2112,18 @@ function Stats.truePerHour(total, secs)
     return math.floor(total / (secs / 3600) + 0.5)
 end
 function Stats.pressRate()
+    local t = now()
     if Stats.showTrue then
+        if t - Stats.trueRateAt < 5 then return end
         Stats.showTrue, Stats.rateClicks = false, {}
         return
     end
-    local t = now()
     for i = #Stats.rateClicks, 1, -1 do
         if t - Stats.rateClicks[i] > 5 then table.remove(Stats.rateClicks, i) end
     end
     Stats.rateClicks[#Stats.rateClicks + 1] = t
     if #Stats.rateClicks >= 5 then
-        Stats.showTrue, Stats.rateClicks = true, {}
+        Stats.showTrue, Stats.rateClicks, Stats.trueRateAt = true, {}, t
     end
 end
 function Stats.rows()
@@ -3370,7 +3402,7 @@ function UI.makeTooltips(gui)
         flightMode = "Choose Tween or Lerp movement. Teleport is currently unavailable.",
         hideLobby = "While farming, waits below the lobby between rounds.",
         hideUnderMap = "While farming, waits below the round map before coins spawn, then flies directly to the selected coin.",
-        pathfindingESP = "Draws the active flight route and outlines the selected coin through walls. Visual only; does not change movement.",
+        pathfindingESP = "Draws a bright yellow flight route and a yellow wireframe box around the selected coin through walls. Visual only; does not change movement.",
         antiAfk = "Toggles the hub's idle-handling feature.",
         antiFling = "Toggles the character's velocity protection.",
         overlay = "Shows or hides the live statistics panel.",
@@ -4230,22 +4262,9 @@ function UI.build()
             v = create("TextLabel", {Font = Theme.Medium, TextSize = 12, TextColor3 = Theme.Text, BackgroundTransparency = 1, Position = UDim2.fromScale(0.55, 0),
                 Size = UDim2.fromScale(0.45, 1), TextXAlignment = RIGHT, TextTruncate = Enum.TextTruncate.AtEnd, Parent = r})}
     end
-    local statsTips = {
-        {"Coins owned", "Current regular-coin balance reported by the game."},
-        {"Running", "Elapsed time since this session started."},
-        {"Coins / hour", "Estimated hourly collection rate. Click to switch rate displays."},
-        {"Coins Total", "Total coins counted during this session."},
-        {"Rounds", "Number of counted rounds this session."},
-        {"Full bags", "Number of completed coin bags this session."},
-        {"Bag", "Current bag count and reported or fallback capacity."},
-        {"Map", "Current map or lobby status."},
-    }
-    for i, spec in ipairs(statsTips) do tip(UI.statRows[i].row, spec[1], nil, spec[2]) end
     local rateHit = create("TextButton", {Text = "", BackgroundTransparency = 1,
         Size = UDim2.fromScale(1, 1), Parent = UI.statRows[3].row})
     rateHit.MouseButton1Click:Connect(Stats.pressRate)
-    tip(overlay, "Farm status")
-    tip(rateHit, "Coins / hour")
 
     local toastLayout = listLayout(6)
     toastLayout.VerticalAlignment = Enum.VerticalAlignment.Bottom
@@ -4308,7 +4327,12 @@ function UI.update()
             for i, r in ipairs(UI.statRows) do
                 local data = rows[i]
                 r.row.Visible = data ~= nil
-                if data then r.k.Text, r.v.Text = tostring(data[1]), tostring(data[2]) end
+                if data then
+                    r.k.Text, r.v.Text = tostring(data[1]), tostring(data[2])
+                    if i == 3 then
+                        r.v.TextColor3 = Stats.showTrue and Theme.Green or Theme.Text
+                    end
+                end
             end
         end
     end
