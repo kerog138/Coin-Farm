@@ -2221,13 +2221,20 @@ local Theme = {
     Accent = Color3.fromRGB(124, 108, 255), AccentHi = Color3.fromRGB(160, 148, 255), Text = Color3.fromRGB(236, 236, 242),
     Sub = Color3.fromRGB(146, 146, 162), Danger = Color3.fromRGB(240, 96, 96), Green = Color3.fromRGB(80, 210, 140),
     Yellow = Color3.fromRGB(240, 196, 70), White = Color3.fromRGB(255, 255, 255),
-    Font = Enum.Font.Gotham, Medium = Enum.Font.GothamMedium, Bold = Enum.Font.GothamBold,
+    Font = Enum.Font.BuilderSans, Medium = Enum.Font.BuilderSansMedium, Bold = Enum.Font.BuilderSansBold,
 }
 local LEFT, RIGHT = Enum.TextXAlignment.Left, Enum.TextXAlignment.Right
 local function create(class, props, children)
     local o = Instance.new(class)
     if o:IsA("GuiObject") then o.BorderSizePixel = 0 end
     if o:IsA("TextButton") then o.AutoButtonColor = false o.Text = "" end
+    -- Keep text rendering consistent; explicit per-element settings still take priority.
+    if o:IsA("TextLabel") or o:IsA("TextButton") or o:IsA("TextBox") then
+        o.Font = Theme.Font
+        o.TextScaled = false
+        o.RichText = false
+        o.TextWrapped = false
+    end
     for k, v in pairs(props or {}) do if k ~= "Parent" then o[k] = v end end
     for _, c in ipairs(children or {}) do c.Parent = o end
     if props and props.Parent then o.Parent = props.Parent end
