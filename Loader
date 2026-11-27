@@ -452,12 +452,34 @@ local function shopKey(value) return tostring(value or ""):lower():gsub("[^%w]",
 local function nativeShopCard(variant, id)
     local items = variant:FindFirstChild("Items", true)
     local grid = items and items:FindFirstChild("ScrollFrame", true)
-    return grid and grid:FindFirstChild(id)
+    local root = grid or items
+    if not root then return nil end
+    local exact = root:FindFirstChild(id)
+    if exact and exact:IsA("GuiObject") then return exact end
+    local match
+    for _, node in ipairs(root:GetDescendants()) do
+        if node:IsA("GuiObject") then
+            local matches = shopKey(node.Name) == shopKey(id)
+            for _, attr in ipairs({"ItemID", "ItemId", "ShopItemID", "ProductID"}) do
+                local value = node:GetAttribute(attr)
+                if value ~= nil and tostring(value) == id then matches = true end
+            end
+            if matches then
+                if match and node:IsDescendantOf(match) then
+                    -- Prefer the enclosing item card over its children.
+                elseif match and match:IsDescendantOf(node) then match = node
+                elseif match then return nil
+                else match = node end
+            end
+        end
+    end
+    return match
 end
 local function nativeName(id)
     for _, variant in ipairs(shopVariants()) do
         local card = nativeShopCard(variant, id)
-        local label = card and try(function() return card.ItemName.TextLabel end)
+        local title = card and card:FindFirstChild("ItemName", true)
+        local label = title and (title:IsA("TextLabel") and title or title:FindFirstChildWhichIsA("TextLabel", true))
         if label and label:IsA("TextLabel") and label.Text ~= "" then return label.Text end
     end
 end
@@ -695,18 +717,20 @@ local function shopWaitFor(test, entry, seconds)
 end
 local function cardFor(variant, entry)
     local card = nativeShopCard(variant, entry.id)
-    local action = card and try(function() return card.Container.ActionButton end)
+    local action = card and (try(function() return card.Container.ActionButton end)
+        or card:FindFirstChild("ActionButton", true))
     if action and action:IsA("GuiButton") and shopPageVisible(action, variant) then return action end
+    if card and card:IsA("GuiButton") and shopPageVisible(card, variant) then return card end
     local view = variant:FindFirstChild("ViewContents", true)
     local idKey, nameKey = shopKey(entry.id), shopKey(entry.name)
-    local best, score = nil, 0
+    local best, score, tied = nil, 0, false
     local function offer(button, points)
         if not button or not button:IsA("GuiButton") or not shopPageVisible(button, variant)
             or (view and button:IsDescendantOf(view)) then return end
-        local area = button.AbsoluteSize.X * button.AbsoluteSize.Y
-        local bestArea = best and best.AbsoluteSize.X * best.AbsoluteSize.Y or math.huge
-        if points > score or (points == score and area < bestArea) then
-            best, score = button, points
+        if points > score then
+            best, score, tied = button, points, false
+        elseif points == score and button ~= best then
+            tied = true
         end
     end
     for _, node in ipairs(variant:GetDescendants()) do
@@ -746,27 +770,68 @@ local function cardFor(variant, entry)
             end
         end
     end
-    return best
+    return not tied and best or nil
 end
 local function selectedView(variant, entry)
-    local popup = variant:FindFirstChild("BuyPopup", true)
-    if popup and shopPageVisible(popup, variant) then
-        for _, node in ipairs(popup:GetDescendants()) do
-            if node:IsA("TextLabel") then
-                local key = shopKey(node.Text)
-                if key == shopKey(entry.id) or key == shopKey(entry.name) then return popup end
+    local idKey, nameKey = shopKey(entry.id), shopKey(entry.name)
+    local function matches(value)
+        local key = shopKey(value)
+        return key ~= "" and (key == idKey or key == nameKey)
+    end
+    local function matchesPane(pane)
+        if not pane or not shopPageVisible(pane, variant) then return false end
+        local nodes = {pane}
+        for _, node in ipairs(pane:GetDescendants()) do nodes[#nodes + 1] = node end
+        local hasTitle, titleMatch = false, false
+        for _, node in ipairs(nodes) do
+            if shopPageVisible(node, variant) then
+                for _, attr in ipairs({"ItemID", "ItemId", "ShopItemID", "ProductID"}) do
+                    if tostring(node:GetAttribute(attr) or "") == entry.id then return true end
+                end
+                if node:IsA("TextLabel") or node:IsA("TextButton") then
+                    local parent, title = node, false
+                    for _ = 1, 3 do
+                        if not parent or parent == pane then break end
+                        local key = shopKey(parent.Name)
+                        if key == "itemname" or key == "productname" or key == "boxname"
+                            or key == "title" or key == "namelabel" or key == "itemtitle" then
+                            title = true break
+                        end
+                        parent = parent.Parent
+                    end
+                    if title and node.Text ~= "" then
+                        hasTitle = true
+                        if matches(node.Text) then titleMatch = true end
+                    end
+                end
             end
         end
+        if titleMatch then return true end
+        if hasTitle then return false end
+        -- Older popups may have an unnamed title. Only accept an exact visible label.
+        -- Do not mistake an item inside a crate's contents list for the selected crate.
+        for _, node in ipairs(nodes) do
+            if (node:IsA("TextLabel") or node:IsA("TextButton")) and shopPageVisible(node, variant)
+                and matches(node.Text) then
+                local parent, insideList = node.Parent, false
+                while parent and parent ~= pane do
+                    local key = shopKey(parent.Name)
+                    if parent:IsA("ScrollingFrame") or key == "contents" or key == "items"
+                        or key == "rewards" or key == "itemlist" then insideList = true break end
+                    parent = parent.Parent
+                end
+                if not insideList then return true end
+            end
+        end
+        return false
+    end
+    local popup = variant:FindFirstChild("BuyPopup", true)
+    if popup and shopPageVisible(popup, variant) then
+        -- A visible popup takes precedence over the background contents page.
+        return matchesPane(popup) and popup or nil
     end
     local view = variant:FindFirstChild("ViewContents", true)
-    if not view or not shopPageVisible(view, variant) then return nil end
-    local idKey, nameKey = shopKey(entry.id), shopKey(entry.name)
-    for _, node in ipairs(view:GetDescendants()) do
-        if node:IsA("TextLabel") or node:IsA("TextButton") then
-            local key = shopKey(node.Text)
-            if key == idKey or key == nameKey then return view end
-        end
-    end
+    return matchesPane(view) and view or nil
 end
 local SHOP_TABS = {"boxes", "weapons", "weaponboxes", "powers", "perks",
     "emotes", "toys", "pets", "eggs", "effects", "radios"}
@@ -778,7 +843,8 @@ local function tabName(button)
     end
     for _, key in ipairs(candidates) do
         for _, name in ipairs(SHOP_TABS) do
-            if key == name or key == name .. "button" or key == name .. "tab" then return name end
+            if key == name or key == name .. "button" or key == name .. "tab"
+                or key == "button" .. name or key == "tab" .. name then return name end
         end
     end
 end
@@ -793,7 +859,9 @@ local function categoryButtons(variant, category)
             if key then
                 if key == wanted
                     or (wanted == "emotes" and key == "toys")
-                    or (wanted == "eggs" and key == "pets") then
+                    or (wanted == "eggs" and key == "pets")
+                    or (wanted == "boxes" and (key == "weapons" or key == "weaponboxes"))
+                    or (wanted == "powers" and key == "perks") then
                     preferred[#preferred + 1] = node
                 else
                     out[#out + 1] = node
@@ -941,7 +1009,6 @@ local function coinBuyButton(view, price, balance, variant, entry)
             if visible(node) then
                 local kind = currencyOf(node)
                 local image = imageOf(node)
-                if kind == "other" or (image and otherIcons[image]) then hasOther = true end
                 local inCurrencyBalance = false
                 local parent = node
                 while parent and parent ~= view do
@@ -952,6 +1019,7 @@ local function coinBuyButton(view, price, balance, variant, entry)
                     parent = parent.Parent
                 end
                 if not inCurrencyBalance then
+                    if kind == "other" or (image and otherIcons[image]) then hasOther = true end
                     if kind == "coins" or (image and coinIcons[image] and not otherIcons[image]) then hasCoin = true end
                     local value = amount(caption(node)) or amount(node:GetAttribute("Price"))
                     if value == price then hasPrice = true end
@@ -982,10 +1050,10 @@ local function coinBuyButton(view, price, balance, variant, entry)
         end
     end
     if count == 1 then for button in pairs(candidates) do return button end end
-    -- The native BuyPopup may show only an unlabeled currency image. In that
-    -- layout, use the selected item's catalog price as currency evidence only
-    -- when the catalog has exactly one currency and the popup has one price row.
-    if count == 0 and view.Name == "BuyPopup" and entry and balance >= price then
+    -- A coin-only catalog item may use an unlabeled currency icon in either
+    -- native purchase layout. Require a single matching native price row and
+    -- a single Buy action; never infer a mixed-currency button from price alone.
+    if count == 0 and entry and balance >= price then
         local catalog = Data.shop()
         local item = type(catalog) == "table" and catalog[entry.id]
         local prices = type(item) == "table" and item.Price
@@ -995,30 +1063,25 @@ local function coinBuyButton(view, price, balance, variant, entry)
                 if key ~= "Coins" then coinsOnly = false break end
             end
         end
-        local priceFrame = try(function() return view.Container.Right.PriceFrame end)
-        if coinsOnly and priceFrame and visible(priceFrame) then
+        if coinsOnly then
             local row, rowCount = nil, 0
-            for _, child in ipairs(priceFrame:GetChildren()) do
-                if child:IsA("GuiObject") and visible(child) then
-                    if child.Name == "CurrencyPriceFrame" then
-                        row, rowCount = child, rowCount + 1
-                    else
-                        -- A different visible purchase layout is ambiguous.
-                        rowCount = rowCount + 2
-                    end
+            for _, node in ipairs(nodes(view)) do
+                if visible(node) and node.Name == "CurrencyPriceFrame" then
+                    row, rowCount = node, rowCount + 1
                 end
             end
-            if rowCount == 1 and row and priceOf(row) == price then
-                local buy = row:FindFirstChild("Buy")
+            if rowCount == 1 and row then
+                local buy = row:FindFirstChild("Buy", true)
                 local icon = try(function() return row.Container.Icon end)
                 local priceLabel = try(function() return row.Container.PriceFrame.PriceLabel end)
                 if buy and visible(buy) and isBuy(buy) and icon and visible(icon)
                     and imageOf(icon) and priceLabel and visible(priceLabel)
                     and amount(caption(priceLabel)) == price then
                     local _, other, priced, includes, buys = inspect(row, buy)
-                    local _, frameOther, _, _, frameBuys = inspect(priceFrame, buy)
-                    if not other and not frameOther and priced and includes
-                        and buys == 1 and frameBuys == 1 then return buy end
+                    local _, _, _, _, viewBuys = inspect(view, buy)
+                    if not other and priced and includes and buys == 1 and viewBuys == 1 then
+                        return buy
+                    end
                 end
             end
         end
@@ -1050,6 +1113,31 @@ function Shop.purchase(entry)
     if balance < entry.price then return false, "Waiting for more coins." end
     if not shopStillSelected(entry) then return false, "Auto shop stopped." end
     local view, activeVariant
+    local function resetStaleView(variant)
+        for _ = 1, 3 do
+            if not shopStillSelected(entry) then return false end
+            local pane = variant:FindFirstChild("BuyPopup", true)
+            if not pane or not shopPageVisible(pane, variant) then
+                pane = variant:FindFirstChild("ViewContents", true)
+            end
+            if not pane or not shopPageVisible(pane, variant) then return true end
+            if not Shop.needsReset and selectedView(variant, entry) == pane then return true end
+            -- Some layouts keep the contents panel beside an active item list.
+            if pane.Name == "ViewContents" and cardFor(variant, entry) then return true end
+            local close
+            for _, name in ipairs({"Close", "CloseButton", "Back", "BackButton", "Return", "ReturnButton", "Cancel", "CancelButton"}) do
+                local node = pane:FindFirstChild(name, true)
+                local button = node and (node:IsA("GuiButton") and node or node:FindFirstChildWhichIsA("GuiButton", true))
+                if button and shopPageVisible(button, variant) then close = button break end
+            end
+            local method = close and shopMethod(close, Shop.workingClickMethod)
+            if not method or not shopClickBy(close, method) then return false end
+            if not shopWaitFor(function()
+                return not pane.Parent or not shopPageVisible(pane, variant)
+            end, entry, 1.25) then return false end
+        end
+        return false
+    end
     local function selectCard(variant)
         local current = selectedView(variant, entry)
         if current then return current end
@@ -1065,6 +1153,8 @@ function Shop.purchase(entry)
     end
     for _, variant in ipairs(shopVariants()) do
         if not shopStillSelected(entry) then return false, "Auto shop stopped." end
+        if not resetStaleView(variant) then continue end
+        Shop.needsReset = false
         view = selectCard(variant)
         if not view then
             for _, tab in ipairs(categoryButtons(variant, entry.category)) do
@@ -1130,6 +1220,13 @@ function Shop.purchase(entry)
     if state == "owned" then return false, "Selected item is already owned." end
     if state == "waiting" then return false, "Waiting for inventory data." end
     if not shopStillSelected(entry) then return false, "Auto shop stopped." end
+    local current = selectedView(activeVariant, entry)
+    local freshBalance = readBalanceNow()
+    if not current or current ~= view or not freshBalance or freshBalance < entry.price
+        or coinBuyButton(current, entry.price, freshBalance, activeVariant, entry) ~= buy then
+        return false, "Purchase controls changed; retrying item lookup."
+    end
+    balance = freshBalance
     -- Once dispatched, never fire a second purchase blindly on a timeout.
     Shop.purchasePending = true
     if not shopClickBy(buy, method) then return false, "Purchase result uncertain; verify the inventory." end
@@ -1140,6 +1237,7 @@ function Shop.purchase(entry)
         local after = readBalanceNow()
         if (after and after <= balance - entry.price) or Shop.isOwned(entry) == true then
             Shop.purchasePending = false
+            Shop.needsReset = true
             balCache.at = -math.huge
             return true
         end
@@ -1196,7 +1294,7 @@ function Shop.step()
     local catalog, balance = Shop.catalog(), readBalanceNow()
     if not balance then Shop.status = "Waiting for the coin balance..." return 2 end
     local eligible, selected, waiting, removed = {}, 0, 0, 0
-    for _, entry in ipairs(catalog) do
+    for index, entry in ipairs(catalog) do
         if Settings.shopSelected[entry.id] then
             local state = Shop.selectionState(entry)
             if state == "owned" then
@@ -1206,7 +1304,7 @@ function Shop.step()
                 if state == "waiting" then
                     waiting = waiting + 1
                 elseif entry.price <= balance then
-                    eligible[#eligible + 1] = entry
+                    eligible[#eligible + 1] = {entry = entry, index = index}
                 end
             end
         end
@@ -1220,8 +1318,12 @@ function Shop.step()
             or "Waiting for enough coins for a selected item."
         return 2
     end
-    Shop.cursor = Shop.cursor % #eligible + 1
-    local entry = eligible[Shop.cursor]
+    local nextItem = eligible[1]
+    for _, candidate in ipairs(eligible) do
+        if candidate.index > Shop.cursor then nextItem = candidate break end
+    end
+    Shop.cursor = nextItem.index
+    local entry = nextItem.entry
     Shop.busy = true
     Shop.status = "Buying " .. entry.name .. " for " .. entry.price .. " coins..."
     Shop.purchasePending = false
